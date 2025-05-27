@@ -1,6 +1,6 @@
-from fastapi import APIRouter, HTTPException, Body, UploadFile, File, Form, Query
+from fastapi import APIRouter, HTTPException, Form, UploadFile, File
 from pydantic import BaseModel
-from openai import OpenAI
+import openai
 import os
 import boto3
 import io
@@ -11,24 +11,18 @@ from google_search import google_search  # Import your google search function
 
 load_dotenv()
 
-api_key = os.environ.get("OPENAI_API_KEY")
-if not api_key:
+openai.api_key = os.getenv("OPENAI_API_KEY")
+if not openai.api_key:
     print("WARNING: OPENAI_API_KEY environment variable not found!")
     print("API calls will fail. Please check your .env file.")
 
-try:
-    client = OpenAI(api_key=api_key)
-except Exception as e:
-    print(f"Error initializing OpenAI client: {e}")
-    client = None
-
-S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "llm-customer-uploads")
+S3_BUCKET = os.getenv("S3_BUCKET_NAME", "llm-customer-uploads")
 try:
     s3_client = boto3.client(
         "s3",
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-        region_name=os.environ.get("AWS_REGION", "us-east-1")
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        region_name=os.getenv("AWS_REGION", "us-east-1")
     )
 except Exception as e:
     print(f"Error initializing S3 client: {e}")
@@ -57,10 +51,10 @@ async def chat_endpoint(
     history: str = Form("[]"),
     files: List[UploadFile] = File([])
 ):
-    if client is None:
+    if not openai.api_key:
         raise HTTPException(
             status_code=500,
-            detail="OpenAI client not initialized. Please check your OPENAI_API_KEY environment variable."
+            detail="OpenAI API key not configured. Please set OPENAI_API_KEY."
         )
     
     try:
@@ -107,21 +101,21 @@ async def chat_endpoint(
             try:
                 search_results = google_search(message, num_results=3)
                 user_content += f"\n\n[Real-time data from Google Search]:\n{search_results}"
-            except Exception as e:
+            except Exception:
                 user_content += "\n\n[Note: Failed to fetch real-time data]"
         
         messages = parsed_history
         messages.append({"role": "user", "content": user_content})
         
-        response = client.chat.completions.create(
+        response = openai.ChatCompletion.create(
             model="gpt-4",
             messages=messages,
             temperature=0.7,
-            max_tokens=8000
+            max_tokens=6000
         )
         
         return ChatResponse(
-            response=response.choices[0].message.content,
+            response=response.choices[0].message['content'],
             uploaded_files=uploaded_file_paths if uploaded_file_paths else None
         )
     except Exception as e:
