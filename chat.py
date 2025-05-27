@@ -7,15 +7,20 @@ import io
 import json
 from typing import List, Optional
 from dotenv import load_dotenv
+import httpx
 
 # Load environment variables
 load_dotenv()
 
-# Get API key with better error handling
+# Get API keys from environment variables
 api_key = os.environ.get("OPENAI_API_KEY")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID")  # Custom Search Engine ID
+
 if not api_key:
-    print("WARNING: OPENAI_API_KEY environment variable not found!")
-    print("API calls will fail. Please check your .env file.")
+    print("WARNING: OPENAI_API_KEY environment variable not found! API calls will fail.")
+if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+    print("WARNING: GOOGLE_API_KEY or GOOGLE_CSE_ID environment variables not found! Google Search will be disabled.")
 
 # Set up OpenAI API client
 try:
@@ -49,18 +54,48 @@ class ChatResponse(BaseModel):
     response: str
     uploaded_files: Optional[List[str]] = None
 
+async def google_search(query: str, num_results: int = 3) -> str:
+    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+        return "Google Search API credentials not configured."
+    
+    search_url = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        "key": GOOGLE_API_KEY,
+        "cx": GOOGLE_CSE_ID,
+        "q": query,
+        "num": num_results,
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(search_url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("items", [])
+            if not items:
+                return "No relevant information found from Google Search."
+            
+            snippets = []
+            for item in items:
+                title = item.get("title", "")
+                snippet = item.get("snippet", "")
+                link = item.get("link", "")
+                snippets.append(f"{title}\n{snippet}\n{link}")
+            
+            return "\n\n".join(snippets)
+    except Exception as e:
+        return f"Error fetching search results: {str(e)}"
+
 @router.post("/", response_model=ChatResponse)
 async def chat_endpoint(
     request: ChatRequest = Body(...),
 ):
     """
-    Chat with OpenAI API (text-only)
+    Chat with OpenAI API with live Google Search integration
     
     - **message**: The user's message (required)
     - **customer_id**: Optional customer identifier for personalization
     - **history**: Optional chat history
     """
-    # Check if client was initialized properly
     if client is None:
         raise HTTPException(
             status_code=500,
@@ -68,11 +103,19 @@ async def chat_endpoint(
         )
     
     try:
-        # Add the message to history
-        messages = request.history
+        # Perform Google Search on user message
+        search_results = await google_search(request.message)
+        
+        # Prepare messages with search context included as system message
+        messages = request.history or []
+        
+        # Add system message with Google search results to guide GPT
+        messages.append({"role": "system", "content": f"Use the following real-time information to answer user questions:\n{search_results}"})
+        
+        # Add user message
         messages.append({"role": "user", "content": request.message})
         
-        # Call OpenAI API
+        # Call OpenAI API with augmented messages
         response = client.chat.completions.create(
             model="gpt-4",
             messages=messages,
@@ -102,14 +145,12 @@ async def chat_with_files_endpoint(
     - **history**: Optional chat history as JSON string
     - **files**: Files to upload and consider in the chat (required)
     """
-    # Check if client was initialized properly
     if client is None:
         raise HTTPException(
             status_code=500,
             detail="OpenAI client not initialized. Please check your OPENAI_API_KEY environment variable."
         )
     
-    # Check if S3 client is available for file uploads
     if s3_client is None:
         raise HTTPException(
             status_code=500,
@@ -117,13 +158,11 @@ async def chat_with_files_endpoint(
         )
     
     try:
-        # Parse history
         try:
             parsed_history = json.loads(history)
         except json.JSONDecodeError:
             parsed_history = []
         
-        # Upload files
         file_references = []
         uploaded_file_paths = []
         chat_folder = f"{customer_id}/chat_files/"
@@ -133,7 +172,6 @@ async def chat_with_files_endpoint(
                 file_content = await file.read()
                 file_name = file.filename
                 
-                # Save under: customer_id/chat_files/filename
                 s3_key = f"{chat_folder}{file_name}"
                 
                 s3_client.put_object(
@@ -145,16 +183,15 @@ async def chat_with_files_endpoint(
                 file_references.append(f"File uploaded: {file_name}")
                 uploaded_file_paths.append(s3_key)
         
-        # Create the user message
         user_content = message
         if file_references:
             user_content += "\n\nFiles uploaded:\n" + "\n".join(file_references)
             
-        # Add the message to history
         messages = parsed_history
+        
+        # Optionally, add Google Search results here too if desired (not implemented now)
         messages.append({"role": "user", "content": user_content})
         
-        # Call OpenAI API
         response = client.chat.completions.create(
             model="gpt-4",
             messages=messages,
@@ -196,7 +233,6 @@ async def list_chat_files(customer_id: str):
         file_details = []
         
         for key in files:
-            # Extract just the filename from the full path
             filename = key.split('/')[-1]
             file_details.append({
                 "full_path": key,
@@ -225,22 +261,19 @@ async def delete_chat_file(customer_id: str, file_name: str):
         )
     
     try:
-        # Construct the S3 key using the customer_id and file_name
         s3_key = f"{customer_id}/chat_files/{file_name}"
         
-        # Check if the file exists before attempting to delete
         try:
             s3_client.head_object(Bucket=S3_BUCKET, Key=s3_key)
         except s3_client.exceptions.ClientError as e:
             if e.response['Error']['Code'] == '404':
                 raise HTTPException(
-                    status_code=404, 
+                    status_code=404,
                     detail=f"Chat file not found: {file_name} for customer: {customer_id}"
                 )
             else:
                 raise
         
-        # Delete the file from S3
         s3_client.delete_object(
             Bucket=S3_BUCKET,
             Key=s3_key
@@ -255,6 +288,6 @@ async def delete_chat_file(customer_id: str, file_name: str):
         raise
     except Exception as e:
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail=f"Error deleting chat file: {str(e)}"
         )
