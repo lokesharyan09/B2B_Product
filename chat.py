@@ -126,7 +126,7 @@ async def chat_endpoint(
             model="gpt-4",
             messages=messages,
             temperature=0.7,
-            max_tokens=8000
+            max_tokens=3000
         )
 
         return ChatResponse(
