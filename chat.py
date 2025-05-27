@@ -1,9 +1,10 @@
-from fastapi import APIRouter, HTTPException, Form, UploadFile, File
+from fastapi import APIRouter, HTTPException, Body, UploadFile, File, Form, Query
 from pydantic import BaseModel
+from openai import OpenAI
 import os
 import boto3
+import io
 import json
-import openai
 from typing import List, Optional
 from dotenv import load_dotenv
 
@@ -16,8 +17,12 @@ if not api_key:
     print("WARNING: OPENAI_API_KEY environment variable not found!")
     print("API calls will fail. Please check your .env file.")
 
-# Set OpenAI API key
-openai.api_key = api_key
+# Set up OpenAI API client
+try:
+    client = OpenAI(api_key=api_key)
+except Exception as e:
+    print(f"Error initializing OpenAI client: {e}")
+    client = None
 
 # S3 setup
 S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "llm-customer-uploads")
@@ -46,23 +51,69 @@ class ChatResponse(BaseModel):
 
 @router.post("/", response_model=ChatResponse)
 async def chat_endpoint(
-    message: str = Form(...),
-    customer_id: Optional[str] = Form(None),
-    history: str = Form("[]"),  # JSON stringified history
-    files: List[UploadFile] = File([])  # Optional files
+    request: ChatRequest = Body(...),
 ):
     """
-    Chat with OpenAI API with optional file upload support
+    Chat with OpenAI API (text-only)
     
-    - **message**: The user's message
+    - **message**: The user's message (required)
     - **customer_id**: Optional customer identifier for personalization
-    - **history**: Optional chat history as JSON string
-    - **files**: Optional files to upload and consider in the chat
+    - **history**: Optional chat history
     """
-    if not openai.api_key:
+    # Check if client was initialized properly
+    if client is None:
         raise HTTPException(
             status_code=500,
-            detail="OpenAI API key not configured. Please set OPENAI_API_KEY environment variable."
+            detail="OpenAI client not initialized. Please check your OPENAI_API_KEY environment variable."
+        )
+    
+    try:
+        # Add the message to history
+        messages = request.history
+        messages.append({"role": "user", "content": request.message})
+        
+        # Call OpenAI API
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=8000
+        )
+        
+        return ChatResponse(
+            response=response.choices[0].message.content,
+            uploaded_files=None
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error with OpenAI API: {str(e)}")
+
+@router.post("/with-files", response_model=ChatResponse)
+async def chat_with_files_endpoint(
+    message: str = Form(...),
+    customer_id: str = Form(...),  # Required for file uploads
+    history: str = Form("[]"),  # JSON stringified history
+    files: List[UploadFile] = File(...)  # Required files
+):
+    """
+    Chat with OpenAI API with file upload support
+    
+    - **message**: The user's message (required)
+    - **customer_id**: Customer identifier for file organization (required)
+    - **history**: Optional chat history as JSON string
+    - **files**: Files to upload and consider in the chat (required)
+    """
+    # Check if client was initialized properly
+    if client is None:
+        raise HTTPException(
+            status_code=500,
+            detail="OpenAI client not initialized. Please check your OPENAI_API_KEY environment variable."
+        )
+    
+    # Check if S3 client is available for file uploads
+    if s3_client is None:
+        raise HTTPException(
+            status_code=500,
+            detail="S3 client not initialized. Cannot upload files."
         )
     
     try:
@@ -72,20 +123,13 @@ async def chat_endpoint(
         except json.JSONDecodeError:
             parsed_history = []
         
-        # Upload files if any
+        # Upload files
         file_references = []
         uploaded_file_paths = []
+        chat_folder = f"{customer_id}/chat_files/"
         
-        if files and customer_id:
-            if s3_client is None:
-                raise HTTPException(
-                    status_code=500,
-                    detail="S3 client not initialized. Cannot upload files."
-                )
-                
-            chat_folder = f"{customer_id}/chat_files/"
-            
-            for file in files:
+        for file in files:
+            if file.filename and file.filename.strip():
                 file_content = await file.read()
                 file_name = file.filename
                 
@@ -100,11 +144,6 @@ async def chat_endpoint(
                 
                 file_references.append(f"File uploaded: {file_name}")
                 uploaded_file_paths.append(s3_key)
-        elif files and not customer_id:
-            raise HTTPException(
-                status_code=400,
-                detail="customer_id is required when uploading files"
-            )
         
         # Create the user message
         user_content = message
@@ -115,8 +154,8 @@ async def chat_endpoint(
         messages = parsed_history
         messages.append({"role": "user", "content": user_content})
         
-        # Call OpenAI API using classic style
-        response = openai.ChatCompletion.create(
+        # Call OpenAI API
+        response = client.chat.completions.create(
             model="gpt-4",
             messages=messages,
             temperature=0.7,
@@ -124,8 +163,8 @@ async def chat_endpoint(
         )
         
         return ChatResponse(
-            response=response.choices[0].message['content'],
-            uploaded_files=uploaded_file_paths if uploaded_file_paths else None
+            response=response.choices[0].message.content,
+            uploaded_files=uploaded_file_paths
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error with OpenAI API: {str(e)}")
