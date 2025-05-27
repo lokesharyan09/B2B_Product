@@ -1,10 +1,9 @@
-from fastapi import APIRouter, HTTPException, Body, UploadFile, File, Form, Query
+from fastapi import APIRouter, HTTPException, Form, UploadFile, File
 from pydantic import BaseModel
-from openai import OpenAI
 import os
 import boto3
-import io
 import json
+import openai
 from typing import List, Optional
 from dotenv import load_dotenv
 
@@ -17,12 +16,8 @@ if not api_key:
     print("WARNING: OPENAI_API_KEY environment variable not found!")
     print("API calls will fail. Please check your .env file.")
 
-# Set up OpenAI API client
-try:
-    client = OpenAI(api_key=api_key)
-except Exception as e:
-    print(f"Error initializing OpenAI client: {e}")
-    client = None
+# Set OpenAI API key
+openai.api_key = api_key
 
 # S3 setup
 S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "llm-customer-uploads")
@@ -64,11 +59,10 @@ async def chat_endpoint(
     - **history**: Optional chat history as JSON string
     - **files**: Optional files to upload and consider in the chat
     """
-    # Check if client was initialized properly
-    if client is None:
+    if not openai.api_key:
         raise HTTPException(
             status_code=500,
-            detail="OpenAI client not initialized. Please check your OPENAI_API_KEY environment variable."
+            detail="OpenAI API key not configured. Please set OPENAI_API_KEY environment variable."
         )
     
     try:
@@ -121,8 +115,8 @@ async def chat_endpoint(
         messages = parsed_history
         messages.append({"role": "user", "content": user_content})
         
-        # Call OpenAI API
-        response = client.chat.completions.create(
+        # Call OpenAI API using classic style
+        response = openai.ChatCompletion.create(
             model="gpt-4",
             messages=messages,
             temperature=0.7,
@@ -130,7 +124,7 @@ async def chat_endpoint(
         )
         
         return ChatResponse(
-            response=response.choices[0].message.content,
+            response=response.choices[0].message['content'],
             uploaded_files=uploaded_file_paths if uploaded_file_paths else None
         )
     except Exception as e:
