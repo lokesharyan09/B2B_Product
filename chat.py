@@ -4,28 +4,23 @@ from openai import OpenAI
 import os
 import boto3
 import json
+import requests
 from typing import List, Optional
 from dotenv import load_dotenv
-import tiktoken
 
-# Load environment variables
 load_dotenv()
 
-# Get API key with better error handling
 api_key = os.environ.get("OPENAI_API_KEY")
-if not api_key:
-    print("WARNING: OPENAI_API_KEY environment variable not found!")
-    print("API calls will fail. Please check your .env file.")
+google_api_key = os.environ.get("GOOGLE_API_KEY")          # Google Cloud API key
+google_cse_id = os.environ.get("GOOGLE_CSE_ID")            # Google Custom Search Engine ID
+S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "llm-customer-uploads")
 
-# Set up OpenAI API client
 try:
     client = OpenAI(api_key=api_key)
 except Exception as e:
-    print(f"Error initializing OpenAI client: {e}")
+    print(f"OpenAI client init error: {e}")
     client = None
 
-# S3 setup
-S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "llm-customer-uploads")
 try:
     s3_client = boto3.client(
         "s3",
@@ -34,10 +29,9 @@ try:
         region_name=os.environ.get("AWS_REGION", "us-east-1")
     )
 except Exception as e:
-    print(f"Error initializing S3 client: {e}")
+    print(f"S3 client init error: {e}")
     s3_client = None
 
-# Create router
 router = APIRouter(prefix="/chat")
 
 class ChatRequest(BaseModel):
@@ -49,51 +43,67 @@ class ChatResponse(BaseModel):
     response: str
     uploaded_files: Optional[List[str]] = None
 
-def count_tokens(messages, model="gpt-4"):
-    """Count tokens used by messages for GPT-4."""
-    encoding = tiktoken.encoding_for_model(model)
-    tokens = 0
-    for message in messages:
-        tokens += 4  # every message follows <im_start>{role/name}\n{content}<im_end>\n
-        for key, value in message.items():
-            tokens += len(encoding.encode(value))
-            if key == "name":
-                tokens -= 1  # role is always required and always 1 token
-    tokens += 2  # every reply is primed with <im_start>assistant
-    return tokens
+def perform_google_search_google_api(query: str) -> str:
+    if not google_api_key or not google_cse_id:
+        return "Google Search API key or CSE ID not configured."
+
+    search_url = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        "key": google_api_key,
+        "cx": google_cse_id,
+        "q": query,
+        "num": 3,
+    }
+    try:
+        res = requests.get(search_url, params=params)
+        res.raise_for_status()
+        data = res.json()
+        snippets = []
+        for item in data.get("items", []):
+            snippet = item.get("snippet")
+            if snippet:
+                snippets.append(snippet)
+        return "\n".join(snippets) if snippets else "No relevant information found."
+    except Exception as e:
+        return f"Search error: {str(e)}"
+
+def trim_messages_to_fit(messages, max_tokens=8000, completion_tokens=1000):
+    approx_token_limit = max_tokens - completion_tokens
+    total_tokens = sum(len(m["content"]) // 4 + 4 for m in messages)
+    while total_tokens > approx_token_limit and messages:
+        messages.pop(0)
+        total_tokens = sum(len(m["content"]) // 4 + 4 for m in messages)
+    return messages
 
 @router.post("/", response_model=ChatResponse)
-async def chat_endpoint(
-    request: ChatRequest = Body(...),
-):
+async def chat_endpoint(request: ChatRequest = Body(...)):
     if client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="OpenAI client not initialized. Please check your OPENAI_API_KEY environment variable."
-        )
+        raise HTTPException(status_code=500, detail="OpenAI client not initialized.")
 
-    try:
-        messages = request.history
+    messages = request.history or []
+
+    user_message_lower = request.message.lower()
+    trigger_keywords = ["inflation rate", "current inflation", "inflation today", "today's inflation", "inflation update"]
+
+    if any(keyword in user_message_lower for keyword in trigger_keywords):
+        search_results = perform_google_search_google_api(request.message)
+        augmented_content = (
+            "Use the following information from the web to answer the question accurately:\n"
+            f"{search_results}\n\nQuestion: {request.message}"
+        )
+        messages.append({"role": "user", "content": augmented_content})
+    else:
         messages.append({"role": "user", "content": request.message})
 
-        used_tokens = count_tokens(messages)
-        max_model_tokens = 8192
-        desired_max_response = 5000  # change this as you want (e.g., 6000 or 7000)
+    messages = trim_messages_to_fit(messages, max_tokens=8000, completion_tokens=1000)
 
-        max_tokens_allowed = max_model_tokens - used_tokens
-        if max_tokens_allowed > desired_max_response:
-            max_tokens_allowed = desired_max_response
-        elif max_tokens_allowed < 500:
-            # If prompt too big, restrict max_tokens for response to 500 minimum
-            max_tokens_allowed = 500
-
+    try:
         response = client.chat.completions.create(
             model="gpt-4",
             messages=messages,
             temperature=0.7,
-            max_tokens=max_tokens_allowed
+            max_tokens=1000
         )
-
         return ChatResponse(
             response=response.choices[0].message.content,
             uploaded_files=None
@@ -109,63 +119,55 @@ async def chat_with_files_endpoint(
     files: List[UploadFile] = File(...)
 ):
     if client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="OpenAI client not initialized. Please check your OPENAI_API_KEY environment variable."
-        )
+        raise HTTPException(status_code=500, detail="OpenAI client not initialized.")
     if s3_client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="S3 client not initialized. Cannot upload files."
-        )
+        raise HTTPException(status_code=500, detail="S3 client not initialized.")
 
     try:
-        try:
-            parsed_history = json.loads(history)
-        except json.JSONDecodeError:
-            parsed_history = []
+        parsed_history = json.loads(history)
+    except json.JSONDecodeError:
+        parsed_history = []
 
-        file_references = []
-        uploaded_file_paths = []
-        chat_folder = f"{customer_id}/chat_files/"
+    file_references = []
+    uploaded_file_paths = []
+    chat_folder = f"{customer_id}/chat_files/"
 
-        for file in files:
-            if file.filename and file.filename.strip():
-                file_content = await file.read()
-                file_name = file.filename
-                s3_key = f"{chat_folder}{file_name}"
-                s3_client.put_object(
-                    Bucket=S3_BUCKET,
-                    Key=s3_key,
-                    Body=file_content
-                )
-                file_references.append(f"File uploaded: {file_name}")
-                uploaded_file_paths.append(s3_key)
+    for file in files:
+        if file.filename and file.filename.strip():
+            file_content = await file.read()
+            s3_key = f"{chat_folder}{file.filename}"
+            s3_client.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=file_content)
+            file_references.append(f"File uploaded: {file.filename}")
+            uploaded_file_paths.append(s3_key)
 
-        user_content = message
-        if file_references:
-            user_content += "\n\nFiles uploaded:\n" + "\n".join(file_references)
+    user_content = message
+    if file_references:
+        user_content += "\n\nFiles uploaded:\n" + "\n".join(file_references)
 
-        messages = parsed_history
+    messages = parsed_history or []
+
+    user_message_lower = message.lower()
+    trigger_keywords = ["inflation rate", "current inflation", "inflation today", "today's inflation", "inflation update"]
+
+    if any(keyword in user_message_lower for keyword in trigger_keywords):
+        search_results = perform_google_search_google_api(message)
+        augmented_content = (
+            "Use the following information from the web to answer the question accurately:\n"
+            f"{search_results}\n\nQuestion: {user_content}"
+        )
+        messages.append({"role": "user", "content": augmented_content})
+    else:
         messages.append({"role": "user", "content": user_content})
 
-        used_tokens = count_tokens(messages)
-        max_model_tokens = 8192
-        desired_max_response = 7000
+    messages = trim_messages_to_fit(messages, max_tokens=8000, completion_tokens=1000)
 
-        max_tokens_allowed = max_model_tokens - used_tokens
-        if max_tokens_allowed > desired_max_response:
-            max_tokens_allowed = desired_max_response
-        elif max_tokens_allowed < 500:
-            max_tokens_allowed = 500
-
+    try:
         response = client.chat.completions.create(
             model="gpt-4",
             messages=messages,
             temperature=0.7,
-            max_tokens=max_tokens_allowed
+            max_tokens=1000
         )
-
         return ChatResponse(
             response=response.choices[0].message.content,
             uploaded_files=uploaded_file_paths
@@ -176,10 +178,8 @@ async def chat_with_files_endpoint(
 @router.get("/files/{customer_id}")
 async def list_chat_files(customer_id: str):
     if s3_client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="S3 client not initialized. Cannot list files."
-        )
+        raise HTTPException(status_code=500, detail="S3 client not initialized.")
+
     try:
         prefix = f"{customer_id}/chat_files/"
         response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
@@ -191,14 +191,7 @@ async def list_chat_files(customer_id: str):
             }
 
         files = [item['Key'] for item in response.get('Contents', [])]
-        file_details = []
-
-        for key in files:
-            filename = key.split('/')[-1]
-            file_details.append({
-                "full_path": key,
-                "filename": filename
-            })
+        file_details = [{"full_path": key, "filename": key.split('/')[-1]} for key in files]
 
         return {
             "message": f"Chat files for customer: {customer_id}",
@@ -210,10 +203,8 @@ async def list_chat_files(customer_id: str):
 @router.delete("/files/{customer_id}/{file_name}")
 async def delete_chat_file(customer_id: str, file_name: str):
     if s3_client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="S3 client not initialized. Cannot delete file."
-        )
+        raise HTTPException(status_code=500, detail="S3 client not initialized.")
+
     try:
         s3_key = f"{customer_id}/chat_files/{file_name}"
 
@@ -221,17 +212,11 @@ async def delete_chat_file(customer_id: str, file_name: str):
             s3_client.head_object(Bucket=S3_BUCKET, Key=s3_key)
         except s3_client.exceptions.ClientError as e:
             if e.response['Error']['Code'] == '404':
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Chat file not found: {file_name} for customer: {customer_id}"
-                )
+                raise HTTPException(status_code=404, detail=f"Chat file not found: {file_name}")
             else:
                 raise
 
-        s3_client.delete_object(
-            Bucket=S3_BUCKET,
-            Key=s3_key
-        )
+        s3_client.delete_object(Bucket=S3_BUCKET, Key=s3_key)
 
         return {
             "message": "Chat file deleted successfully",
@@ -241,7 +226,4 @@ async def delete_chat_file(customer_id: str, file_name: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error deleting chat file: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error deleting chat file: {str(e)}")
