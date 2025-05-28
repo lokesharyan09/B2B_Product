@@ -45,7 +45,7 @@ class ChatResponse(BaseModel):
     response: str
     uploaded_files: Optional[List[str]] = None
 
-# Tool schema for web search using function calling
+# Tool schema for web search (SerpAPI)
 tool_definitions = [{
     "name": "search_web",
     "description": "Perform a real-time web search using SerpAPI",
@@ -61,35 +61,31 @@ tool_definitions = [{
     }
 }]
 
-# Web search function using SerpAPI
-def search_web(query: str) -> str:
+# Web search function
+def search_web(query):
     from serpapi import GoogleSearch
-
     if not SERPAPI_API_KEY:
         return "Web search is unavailable: SERPAPI_API_KEY missing."
     
-    params = {
+    search = GoogleSearch({
         "q": query,
         "api_key": SERPAPI_API_KEY,
-        "num": 3,
-        "engine": "google"
-    }
-    search = GoogleSearch(params)
+        "num": 3
+    })
     results = search.get_dict()
     items = results.get("organic_results", [])
     if not items:
         return "No relevant web results found."
 
-    snippets = []
+    response = []
     for item in items:
-        title = item.get("title", "No title")
-        snippet = item.get("snippet", "")
-        link = item.get("link", "")
-        snippets.append(f"**{title}**\n{snippet}\n{link}")
+        title = item.get("title")
+        snippet = item.get("snippet")
+        link = item.get("link")
+        response.append(f"**{title}**\n{snippet}\n{link}")
+    return "\n\n".join(response)
 
-    return "\n\n".join(snippets)
-
-def run_function_call(name: str, arguments: dict) -> str:
+def run_function_call(name, arguments):
     if name == "search_web":
         return search_web(arguments.get("query", ""))
     return "Unknown function call."
@@ -116,16 +112,19 @@ async def chat(request: ChatRequest = Body(...)):
         message = choice.message
 
         # Check if model wants to call a function
-        if message.get("function_call"):
-            func_name = message["function_call"]["name"]
-            args_json = message["function_call"].get("arguments", "{}")
-            args = json.loads(args_json)
+        if message.function_call:
+            func_name = message.function_call.name
+            args_json = message.function_call.arguments
+            args = json.loads(args_json) if args_json else {}
 
             # Call the tool function with provided arguments
             tool_response = run_function_call(func_name, args)
 
-            # Append model message and tool response to message history
-            messages.append({"role": "assistant", "content": None, "function_call": message["function_call"]})
+            # Append assistant's function call message and the tool response
+            messages.append({"role": "assistant", "content": None, "function_call": {
+                "name": func_name,
+                "arguments": args_json
+            }})
             messages.append({"role": "function", "name": func_name, "content": tool_response})
 
             # Ask model to generate final answer with tool output
@@ -138,7 +137,7 @@ async def chat(request: ChatRequest = Body(...)):
             final_answer = followup.choices[0].message.content
             return ChatResponse(response=final_answer)
 
-        # If no function call, just return model response
+        # No function call - return normal response
         return ChatResponse(response=message.content)
 
     except Exception as e:
