@@ -45,7 +45,7 @@ class ChatResponse(BaseModel):
     response: str
     uploaded_files: Optional[List[str]] = None
 
-# Tool schema for web search (SerpAPI)
+# Tool schema for web search
 tool_definitions = [{
     "name": "search_web",
     "description": "Perform a real-time web search using SerpAPI",
@@ -87,7 +87,7 @@ def search_web(query):
 
 def run_function_call(name, arguments):
     if name == "search_web":
-        return search_web(arguments.get("query", ""))
+        return search_web(arguments.get("query"))
     return "Unknown function call."
 
 @router.post("/", response_model=ChatResponse)
@@ -96,7 +96,16 @@ async def chat(request: ChatRequest = Body(...)):
         raise HTTPException(status_code=500, detail="OpenAI client not initialized")
 
     try:
-        messages = request.history.copy()
+        # Add a system prompt to guide the model to use the search_web function
+        system_message = {
+            "role": "system",
+            "content": (
+                "You are a helpful assistant. Use the 'search_web' function to get real-time "
+                "information when the user asks about current events, data, or any up-to-date facts."
+            )
+        }
+
+        messages = [system_message] + request.history.copy()
         messages.append({"role": "user", "content": request.message})
 
         response = client.chat.completions.create(
@@ -108,36 +117,38 @@ async def chat(request: ChatRequest = Body(...)):
             max_tokens=2000
         )
 
-        choice = response.choices[0]
-        message = choice.message
+        message = response.choices[0].message
 
-        # Check if model wants to call a function
-        if message.function_call:
+        print("Assistant message:", getattr(message, "content", None))
+        print("Function call:", getattr(message, "function_call", None))
+
+        # If model decided to call a function
+        if getattr(message, "function_call", None):
             func_name = message.function_call.name
-            args_json = message.function_call.arguments
-            args = json.loads(args_json) if args_json else {}
+            args = json.loads(message.function_call.arguments)
+            print(f"Function call detected: {func_name} with args: {args}")
 
-            # Call the tool function with provided arguments
+            # Call the tool function
             tool_response = run_function_call(func_name, args)
 
-            # Append assistant's function call message and the tool response
-            messages.append({"role": "assistant", "content": None, "function_call": {
+            # Append the function response and get final answer
+            messages.append(message.dict())
+            messages.append({
+                "role": "function",
                 "name": func_name,
-                "arguments": args_json
-            }})
-            messages.append({"role": "function", "name": func_name, "content": tool_response})
+                "content": tool_response
+            })
 
-            # Ask model to generate final answer with tool output
             followup = client.chat.completions.create(
                 model="gpt-4-turbo",
                 messages=messages,
                 temperature=0.7,
                 max_tokens=2000
             )
-            final_answer = followup.choices[0].message.content
-            return ChatResponse(response=final_answer)
 
-        # No function call - return normal response
+            return ChatResponse(response=followup.choices[0].message.content)
+
+        # Otherwise just return the model answer
         return ChatResponse(response=message.content)
 
     except Exception as e:
