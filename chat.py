@@ -45,52 +45,53 @@ class ChatResponse(BaseModel):
     response: str
     uploaded_files: Optional[List[str]] = None
 
-# Tool schema for web search
+# Tool schema for web search using function calling
 tool_definitions = [{
-    "type": "function",
-    "function": {
-        "name": "search_web",
-        "description": "Perform a real-time web search using SerpAPI",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query to look up"
-                }
-            },
-            "required": ["query"]
-        }
+    "name": "search_web",
+    "description": "Perform a real-time web search using SerpAPI",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query to look up"
+            }
+        },
+        "required": ["query"]
     }
 }]
 
-# Web search function
-def search_web(query):
+# Web search function using SerpAPI
+def search_web(query: str) -> str:
     from serpapi import GoogleSearch
+
     if not SERPAPI_API_KEY:
         return "Web search is unavailable: SERPAPI_API_KEY missing."
     
-    search = GoogleSearch({
+    params = {
         "q": query,
         "api_key": SERPAPI_API_KEY,
-        "num": 3
-    })
+        "num": 3,
+        "engine": "google"
+    }
+    search = GoogleSearch(params)
     results = search.get_dict()
     items = results.get("organic_results", [])
     if not items:
         return "No relevant web results found."
 
-    response = []
+    snippets = []
     for item in items:
-        title = item.get("title")
-        snippet = item.get("snippet")
-        link = item.get("link")
-        response.append(f"**{title}**\n{snippet}\n{link}")
-    return "\n\n".join(response)
+        title = item.get("title", "No title")
+        snippet = item.get("snippet", "")
+        link = item.get("link", "")
+        snippets.append(f"**{title}**\n{snippet}\n{link}")
 
-def run_function_call(name, arguments):
+    return "\n\n".join(snippets)
+
+def run_function_call(name: str, arguments: dict) -> str:
     if name == "search_web":
-        return search_web(arguments.get("query"))
+        return search_web(arguments.get("query", ""))
     return "Unknown function call."
 
 @router.post("/", response_model=ChatResponse)
@@ -105,36 +106,40 @@ async def chat(request: ChatRequest = Body(...)):
         response = client.chat.completions.create(
             model="gpt-4-turbo",
             messages=messages,
-            tools=tool_definitions,
-            tool_choice="auto",
+            functions=tool_definitions,
+            function_call="auto",
             temperature=0.7,
             max_tokens=2000
         )
 
         choice = response.choices[0]
+        message = choice.message
 
-        if choice.finish_reason == "tool_calls":
-            tool_call = choice.message.tool_calls[0]
-            func_name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments)
+        # Check if model wants to call a function
+        if message.get("function_call"):
+            func_name = message["function_call"]["name"]
+            args_json = message["function_call"].get("arguments", "{}")
+            args = json.loads(args_json)
+
+            # Call the tool function with provided arguments
             tool_response = run_function_call(func_name, args)
 
-            messages.append(choice.message)
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": tool_response
-            })
+            # Append model message and tool response to message history
+            messages.append({"role": "assistant", "content": None, "function_call": message["function_call"]})
+            messages.append({"role": "function", "name": func_name, "content": tool_response})
 
+            # Ask model to generate final answer with tool output
             followup = client.chat.completions.create(
                 model="gpt-4-turbo",
                 messages=messages,
                 temperature=0.7,
                 max_tokens=2000
             )
-            return ChatResponse(response=followup.choices[0].message.content)
+            final_answer = followup.choices[0].message.content
+            return ChatResponse(response=final_answer)
 
-        return ChatResponse(response=choice.message.content)
+        # If no function call, just return model response
+        return ChatResponse(response=message.content)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Chat error: {e}")
