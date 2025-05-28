@@ -8,6 +8,8 @@ import json
 from typing import List, Optional
 from dotenv import load_dotenv
 
+from google_search import google_search
+
 # Load environment variables
 load_dotenv()
 

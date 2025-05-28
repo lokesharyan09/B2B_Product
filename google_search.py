@@ -19,16 +19,19 @@ def google_search(query, num_results=3):
         "num": num_results,
     }
 
-    response = requests.get(url, params=params)
-    response.raise_for_status()
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as e:
+        raise RuntimeError(f"Request to Google Custom Search API failed: {e}")
 
-    results = []
-    data = response.json()
     items = data.get("items", [])
+    results = []
     for item in items:
-        title = item.get("title")
-        snippet = item.get("snippet")
-        link = item.get("link")
+        title = item.get("title", "")
+        snippet = item.get("snippet", "")
+        link = item.get("link", "")
         results.append(f"{title}\n{snippet}\n{link}")
 
     return "\n\n".join(results)
