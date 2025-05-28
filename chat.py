@@ -7,17 +7,20 @@ import io
 import json
 from typing import List, Optional
 from dotenv import load_dotenv
-
-from google_search import google_search
+from serpapi import GoogleSearch  # Added SerpAPI import
 
 # Load environment variables
 load_dotenv()
 
-# Get API key with better error handling
+# Get API keys with error handling
 api_key = os.environ.get("OPENAI_API_KEY")
 if not api_key:
     print("WARNING: OPENAI_API_KEY environment variable not found!")
     print("API calls will fail. Please check your .env file.")
+
+SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY")
+if not SERPAPI_API_KEY:
+    print("WARNING: SERPAPI_API_KEY environment variable not found! Web search will be disabled.")
 
 # Set up OpenAI API client
 try:
@@ -51,6 +54,27 @@ class ChatResponse(BaseModel):
     response: str
     uploaded_files: Optional[List[str]] = None
 
+def serpapi_search(query, api_key=SERPAPI_API_KEY, num_results=3):
+    if not api_key:
+        return "Web search is currently disabled because API key is missing."
+    params = {
+        "engine": "google",
+        "q": query,
+        "api_key": api_key,
+        "num": num_results
+    }
+    search = GoogleSearch(params)
+    results = search.get_dict()
+    
+    organic_results = results.get("organic_results", [])
+    snippets = []
+    for res in organic_results[:num_results]:
+        title = res.get("title", "")
+        snippet = res.get("snippet", "")
+        link = res.get("link", "")
+        snippets.append(f"{title}\n{snippet}\n{link}")
+    return "\n\n".join(snippets) if snippets else "No relevant web search results found."
+
 @router.post("/", response_model=ChatResponse)
 async def chat_endpoint(
     request: ChatRequest = Body(...),
@@ -70,10 +94,19 @@ async def chat_endpoint(
         )
     
     try:
-        # Add the message to history
-        messages = request.history
+        # Copy existing chat history and add the user message
+        messages = request.history.copy()
         messages.append({"role": "user", "content": request.message})
-        
+
+        # Perform live web search using SerpAPI
+        web_search_summary = serpapi_search(request.message)
+
+        # Append web search results as system context
+        messages.append({
+            "role": "system",
+            "content": f"Use the following web search results to enhance your answer:\n{web_search_summary}"
+        })
+
         # Call OpenAI API
         response = client.chat.completions.create(
             model="gpt-4",
@@ -87,7 +120,7 @@ async def chat_endpoint(
             uploaded_files=None
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error with OpenAI API: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error with OpenAI API or SerpAPI: {str(e)}")
 
 @router.post("/with-files", response_model=ChatResponse)
 async def chat_with_files_endpoint(
