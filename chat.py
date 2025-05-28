@@ -1,295 +1,213 @@
-from fastapi import APIRouter, HTTPException, Body, UploadFile, File, Form, Query
+from fastapi import APIRouter, HTTPException, Body, UploadFile, File, Form
 from pydantic import BaseModel
 from openai import OpenAI
 import os
 import boto3
-import io
 import json
 from typing import List, Optional
 from dotenv import load_dotenv
-from serpapi import GoogleSearch  # Added SerpAPI import
 
 # Load environment variables
 load_dotenv()
 
-# Get API keys with error handling
-api_key = os.environ.get("OPENAI_API_KEY")
-if not api_key:
-    print("WARNING: OPENAI_API_KEY environment variable not found!")
-    print("API calls will fail. Please check your .env file.")
+# API keys and config
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
+S3_BUCKET = os.getenv("S3_BUCKET_NAME", "llm-customer-uploads")
 
-SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY")
-if not SERPAPI_API_KEY:
-    print("WARNING: SERPAPI_API_KEY environment variable not found! Web search will be disabled.")
-
-# Set up OpenAI API client
+# OpenAI client
 try:
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=OPENAI_API_KEY)
 except Exception as e:
-    print(f"Error initializing OpenAI client: {e}")
+    print(f"OpenAI error: {e}")
     client = None
 
-# S3 setup
-S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "llm-customer-uploads")
+# S3 client
 try:
     s3_client = boto3.client(
         "s3",
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-        region_name=os.environ.get("AWS_REGION", "us-east-1")
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        region_name=os.getenv("AWS_REGION", "us-east-1")
     )
 except Exception as e:
-    print(f"Error initializing S3 client: {e}")
+    print(f"S3 init error: {e}")
     s3_client = None
 
-# Create router
 router = APIRouter(prefix="/chat")
 
 class ChatRequest(BaseModel):
     message: str
     customer_id: Optional[str] = None
-    history: list = []
+    history: List[dict] = []
 
 class ChatResponse(BaseModel):
     response: str
     uploaded_files: Optional[List[str]] = None
 
-def serpapi_search(query, api_key=SERPAPI_API_KEY, num_results=3):
-    if not api_key:
-        return "Web search is currently disabled because API key is missing."
-    params = {
-        "engine": "google",
-        "q": query,
-        "api_key": api_key,
-        "num": num_results
+# Tool schema for web search
+tool_definitions = [{
+    "type": "function",
+    "function": {
+        "name": "search_web",
+        "description": "Perform a real-time web search using SerpAPI",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query to look up"
+                }
+            },
+            "required": ["query"]
+        }
     }
-    search = GoogleSearch(params)
-    results = search.get_dict()
+}]
+
+# Web search function
+def search_web(query):
+    from serpapi import GoogleSearch
+    if not SERPAPI_API_KEY:
+        return "Web search is unavailable: SERPAPI_API_KEY missing."
     
-    organic_results = results.get("organic_results", [])
-    snippets = []
-    for res in organic_results[:num_results]:
-        title = res.get("title", "")
-        snippet = res.get("snippet", "")
-        link = res.get("link", "")
-        snippets.append(f"{title}\n{snippet}\n{link}")
-    return "\n\n".join(snippets) if snippets else "No relevant web search results found."
+    search = GoogleSearch({
+        "q": query,
+        "api_key": SERPAPI_API_KEY,
+        "num": 3
+    })
+    results = search.get_dict()
+    items = results.get("organic_results", [])
+    if not items:
+        return "No relevant web results found."
+
+    response = []
+    for item in items:
+        title = item.get("title")
+        snippet = item.get("snippet")
+        link = item.get("link")
+        response.append(f"**{title}**\n{snippet}\n{link}")
+    return "\n\n".join(response)
+
+def run_function_call(name, arguments):
+    if name == "search_web":
+        return search_web(arguments.get("query"))
+    return "Unknown function call."
 
 @router.post("/", response_model=ChatResponse)
-async def chat_endpoint(
-    request: ChatRequest = Body(...),
-):
-    """
-    Chat with OpenAI API (text-only)
-    
-    - **message**: The user's message (required)
-    - **customer_id**: Optional customer identifier for personalization
-    - **history**: Optional chat history
-    """
-    # Check if client was initialized properly
+async def chat(request: ChatRequest = Body(...)):
     if client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="OpenAI client not initialized. Please check your OPENAI_API_KEY environment variable."
-        )
-    
+        raise HTTPException(status_code=500, detail="OpenAI client not initialized")
+
     try:
-        # Copy existing chat history and add the user message
         messages = request.history.copy()
         messages.append({"role": "user", "content": request.message})
 
-        # Perform live web search using SerpAPI
-        web_search_summary = serpapi_search(request.message)
-
-        # Append web search results as system context
-        messages.append({
-            "role": "system",
-            "content": f"Use the following web search results to enhance your answer:\n{web_search_summary}"
-        })
-
-        # Call OpenAI API
         response = client.chat.completions.create(
-            model="gpt-4",
+            model="gpt-4-turbo",
             messages=messages,
+            tools=tool_definitions,
+            tool_choice="auto",
             temperature=0.7,
-            max_tokens=8000
+            max_tokens=2000
         )
-        
-        return ChatResponse(
-            response=response.choices[0].message.content,
-            uploaded_files=None
-        )
+
+        choice = response.choices[0]
+
+        if choice.finish_reason == "tool_calls":
+            tool_call = choice.message.tool_calls[0]
+            func_name = tool_call.function.name
+            args = json.loads(tool_call.function.arguments)
+            tool_response = run_function_call(func_name, args)
+
+            messages.append(choice.message)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": tool_response
+            })
+
+            followup = client.chat.completions.create(
+                model="gpt-4-turbo",
+                messages=messages,
+                temperature=0.7,
+                max_tokens=2000
+            )
+            return ChatResponse(response=followup.choices[0].message.content)
+
+        return ChatResponse(response=choice.message.content)
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error with OpenAI API or SerpAPI: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Chat error: {e}")
 
 @router.post("/with-files", response_model=ChatResponse)
-async def chat_with_files_endpoint(
+async def chat_with_files(
     message: str = Form(...),
-    customer_id: str = Form(...),  # Required for file uploads
-    history: str = Form("[]"),  # JSON stringified history
-    files: List[UploadFile] = File(...)  # Required files
+    customer_id: str = Form(...),
+    history: str = Form("[]"),
+    files: List[UploadFile] = File(...)
 ):
-    """
-    Chat with OpenAI API with file upload support
-    
-    - **message**: The user's message (required)
-    - **customer_id**: Customer identifier for file organization (required)
-    - **history**: Optional chat history as JSON string
-    - **files**: Files to upload and consider in the chat (required)
-    """
-    # Check if client was initialized properly
-    if client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="OpenAI client not initialized. Please check your OPENAI_API_KEY environment variable."
-        )
-    
-    # Check if S3 client is available for file uploads
-    if s3_client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="S3 client not initialized. Cannot upload files."
-        )
-    
+    if client is None or s3_client is None:
+        raise HTTPException(status_code=500, detail="Client not initialized")
+
     try:
-        # Parse history
-        try:
-            parsed_history = json.loads(history)
-        except json.JSONDecodeError:
-            parsed_history = []
-        
-        # Upload files
-        file_references = []
-        uploaded_file_paths = []
-        chat_folder = f"{customer_id}/chat_files/"
-        
+        parsed_history = json.loads(history)
+        uploaded_paths = []
+        file_notes = []
+
+        folder = f"{customer_id}/chat_files/"
         for file in files:
-            if file.filename and file.filename.strip():
-                file_content = await file.read()
-                file_name = file.filename
-                
-                # Save under: customer_id/chat_files/filename
-                s3_key = f"{chat_folder}{file_name}"
-                
-                s3_client.put_object(
-                    Bucket=S3_BUCKET,
-                    Key=s3_key,
-                    Body=file_content
-                )
-                
-                file_references.append(f"File uploaded: {file_name}")
-                uploaded_file_paths.append(s3_key)
-        
-        # Create the user message
-        user_content = message
-        if file_references:
-            user_content += "\n\nFiles uploaded:\n" + "\n".join(file_references)
-            
-        # Add the message to history
-        messages = parsed_history
-        messages.append({"role": "user", "content": user_content})
-        
-        # Call OpenAI API
+            if file.filename:
+                content = await file.read()
+                key = f"{folder}{file.filename}"
+                s3_client.put_object(Bucket=S3_BUCKET, Key=key, Body=content)
+                uploaded_paths.append(key)
+                file_notes.append(f"Uploaded: {file.filename}")
+
+        user_message = f"{message}\n\n" + "\n".join(file_notes)
+        parsed_history.append({"role": "user", "content": user_message})
+
         response = client.chat.completions.create(
-            model="gpt-4",
-            messages=messages,
+            model="gpt-4-turbo",
+            messages=parsed_history,
             temperature=0.7,
-            max_tokens=8000
+            max_tokens=2000
         )
-        
-        return ChatResponse(
-            response=response.choices[0].message.content,
-            uploaded_files=uploaded_file_paths
-        )
+
+        return ChatResponse(response=response.choices[0].message.content, uploaded_files=uploaded_paths)
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error with OpenAI API: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Chat with files error: {e}")
 
 @router.get("/files/{customer_id}")
-async def list_chat_files(customer_id: str):
-    """
-    List all chat files uploaded for a specific customer
-    
-    - **customer_id**: Unique identifier for the customer
-    """
+async def list_files(customer_id: str):
     if s3_client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="S3 client not initialized. Cannot list files."
-        )
-    
+        raise HTTPException(status_code=500, detail="S3 client not initialized")
+
     try:
         prefix = f"{customer_id}/chat_files/"
         response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
-        
-        if 'Contents' not in response:
-            return {
-                "message": f"No chat files found for customer: {customer_id}",
-                "files": []
-            }
-            
-        files = [item['Key'] for item in response.get('Contents', [])]
-        file_details = []
-        
-        for key in files:
-            # Extract just the filename from the full path
-            filename = key.split('/')[-1]
-            file_details.append({
-                "full_path": key,
-                "filename": filename
-            })
-        
+        contents = response.get("Contents", [])
         return {
-            "message": f"Chat files for customer: {customer_id}",
-            "files": file_details
+            "message": f"Files for {customer_id}",
+            "files": [{"key": obj["Key"], "filename": obj["Key"].split('/')[-1]} for obj in contents]
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing chat files: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error listing files: {e}")
 
 @router.delete("/files/{customer_id}/{file_name}")
-async def delete_chat_file(customer_id: str, file_name: str):
-    """
-    Delete a specific chat file for a customer
-    
-    - **customer_id**: Unique identifier for the customer
-    - **file_name**: Name of the file to delete
-    """
+async def delete_file(customer_id: str, file_name: str):
     if s3_client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="S3 client not initialized. Cannot delete file."
-        )
-    
+        raise HTTPException(status_code=500, detail="S3 client not initialized")
+
     try:
-        # Construct the S3 key using the customer_id and file_name
-        s3_key = f"{customer_id}/chat_files/{file_name}"
-        
-        # Check if the file exists before attempting to delete
-        try:
-            s3_client.head_object(Bucket=S3_BUCKET, Key=s3_key)
-        except s3_client.exceptions.ClientError as e:
-            if e.response['Error']['Code'] == '404':
-                raise HTTPException(
-                    status_code=404, 
-                    detail=f"Chat file not found: {file_name} for customer: {customer_id}"
-                )
-            else:
-                raise
-        
-        # Delete the file from S3
-        s3_client.delete_object(
-            Bucket=S3_BUCKET,
-            Key=s3_key
-        )
-        
-        return {
-            "message": "Chat file deleted successfully",
-            "customer_id": customer_id,
-            "deleted_file": s3_key
-        }
-    except HTTPException:
-        raise
+        key = f"{customer_id}/chat_files/{file_name}"
+        s3_client.head_object(Bucket=S3_BUCKET, Key=key)
+        s3_client.delete_object(Bucket=S3_BUCKET, Key=key)
+        return {"message": "File deleted", "key": key}
+    except s3_client.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] == "404":
+            raise HTTPException(status_code=404, detail="File not found")
+        else:
+            raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Error deleting chat file: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error deleting file: {e}")
