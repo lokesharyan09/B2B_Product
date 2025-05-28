@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Body, UploadFile, File, Form, Query
+from fastapi import APIRouter, HTTPException, Body, UploadFile, File, Form
 from pydantic import BaseModel
 from openai import OpenAI
 import os
@@ -51,18 +51,17 @@ class ChatResponse(BaseModel):
     response: str
     uploaded_files: Optional[List[str]] = None
 
+# New schema for /chat/search endpoint
+class SearchRequest(BaseModel):
+    query: str
+
 @router.post("/", response_model=ChatResponse)
 async def chat_endpoint(
     request: ChatRequest = Body(...),
 ):
     """
     Chat with OpenAI API (text-only)
-    
-    - **message**: The user's message (required)
-    - **customer_id**: Optional customer identifier for personalization
-    - **history**: Optional chat history
     """
-    # Check if client was initialized properly
     if client is None:
         raise HTTPException(
             status_code=500,
@@ -70,11 +69,9 @@ async def chat_endpoint(
         )
     
     try:
-        # Add the message to history
         messages = request.history
         messages.append({"role": "user", "content": request.message})
         
-        # Call OpenAI API
         response = client.chat.completions.create(
             model="gpt-4",
             messages=messages,
@@ -92,26 +89,19 @@ async def chat_endpoint(
 @router.post("/with-files", response_model=ChatResponse)
 async def chat_with_files_endpoint(
     message: str = Form(...),
-    customer_id: str = Form(...),  # Required for file uploads
-    history: str = Form("[]"),  # JSON stringified history
-    files: List[UploadFile] = File(...)  # Required files
+    customer_id: str = Form(...),
+    history: str = Form("[]"),
+    files: List[UploadFile] = File(...)
 ):
     """
     Chat with OpenAI API with file upload support
-    
-    - **message**: The user's message (required)
-    - **customer_id**: Customer identifier for file organization (required)
-    - **history**: Optional chat history as JSON string
-    - **files**: Files to upload and consider in the chat (required)
     """
-    # Check if client was initialized properly
     if client is None:
         raise HTTPException(
             status_code=500,
             detail="OpenAI client not initialized. Please check your OPENAI_API_KEY environment variable."
         )
     
-    # Check if S3 client is available for file uploads
     if s3_client is None:
         raise HTTPException(
             status_code=500,
@@ -119,13 +109,11 @@ async def chat_with_files_endpoint(
         )
     
     try:
-        # Parse history
         try:
             parsed_history = json.loads(history)
         except json.JSONDecodeError:
             parsed_history = []
         
-        # Upload files
         file_references = []
         uploaded_file_paths = []
         chat_folder = f"{customer_id}/chat_files/"
@@ -135,7 +123,6 @@ async def chat_with_files_endpoint(
                 file_content = await file.read()
                 file_name = file.filename
                 
-                # Save under: customer_id/chat_files/filename
                 s3_key = f"{chat_folder}{file_name}"
                 
                 s3_client.put_object(
@@ -147,16 +134,13 @@ async def chat_with_files_endpoint(
                 file_references.append(f"File uploaded: {file_name}")
                 uploaded_file_paths.append(s3_key)
         
-        # Create the user message
         user_content = message
         if file_references:
             user_content += "\n\nFiles uploaded:\n" + "\n".join(file_references)
             
-        # Add the message to history
         messages = parsed_history
         messages.append({"role": "user", "content": user_content})
         
-        # Call OpenAI API
         response = client.chat.completions.create(
             model="gpt-4",
             messages=messages,
@@ -175,8 +159,6 @@ async def chat_with_files_endpoint(
 async def list_chat_files(customer_id: str):
     """
     List all chat files uploaded for a specific customer
-    
-    - **customer_id**: Unique identifier for the customer
     """
     if s3_client is None:
         raise HTTPException(
@@ -198,7 +180,6 @@ async def list_chat_files(customer_id: str):
         file_details = []
         
         for key in files:
-            # Extract just the filename from the full path
             filename = key.split('/')[-1]
             file_details.append({
                 "full_path": key,
@@ -216,9 +197,6 @@ async def list_chat_files(customer_id: str):
 async def delete_chat_file(customer_id: str, file_name: str):
     """
     Delete a specific chat file for a customer
-    
-    - **customer_id**: Unique identifier for the customer
-    - **file_name**: Name of the file to delete
     """
     if s3_client is None:
         raise HTTPException(
@@ -227,10 +205,8 @@ async def delete_chat_file(customer_id: str, file_name: str):
         )
     
     try:
-        # Construct the S3 key using the customer_id and file_name
         s3_key = f"{customer_id}/chat_files/{file_name}"
         
-        # Check if the file exists before attempting to delete
         try:
             s3_client.head_object(Bucket=S3_BUCKET, Key=s3_key)
         except s3_client.exceptions.ClientError as e:
@@ -242,7 +218,6 @@ async def delete_chat_file(customer_id: str, file_name: str):
             else:
                 raise
         
-        # Delete the file from S3
         s3_client.delete_object(
             Bucket=S3_BUCKET,
             Key=s3_key
@@ -260,3 +235,16 @@ async def delete_chat_file(customer_id: str, file_name: str):
             status_code=500, 
             detail=f"Error deleting chat file: {str(e)}"
         )
+
+# --- New Endpoint for Google Search ---
+
+@router.post("/search")
+async def chat_search(request: SearchRequest):
+    """
+    Perform a Google search for the given query and return results.
+    """
+    try:
+        results = google_search(request.query)
+        return {"results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Google Search error: {str(e)}")
